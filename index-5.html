@@ -1,0 +1,381 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Live GPS Tracker</title>
+
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
+
+<style>
+*{box-sizing:border-box}
+body{margin:0;padding:16px;background:#f1f3f8;font-family:Arial,sans-serif;color:#222}
+.card{max-width:430px;margin:10px auto;background:#fff;padding:18px;border-radius:16px;box-shadow:0 4px 18px rgba(0,0,0,.15)}
+h2{text-align:center;margin:4px 0 12px}
+.mode{text-align:center;background:#eef3ff;color:#244b9b;padding:8px;border-radius:8px;font-weight:bold;font-size:13px;margin-bottom:10px}
+.status{text-align:center;padding:10px;border-radius:8px;margin-bottom:10px;font-weight:bold;background:#ffe0e0;color:#d00000}
+.status.on{background:#d9f8df;color:#12852d}
+.row{display:flex;justify-content:space-between;align-items:center;background:#f5f6f8;padding:10px;margin:6px 0;border-radius:7px;font-size:14px;gap:10px}
+.value{font-weight:bold;text-align:right;max-width:65%;word-break:break-word}
+button{width:100%;border:none;padding:13px;margin-top:9px;border-radius:8px;font-size:15px;font-weight:bold;cursor:pointer}
+#startBtn{background:#159447;color:white}
+#stopBtn{background:#d32626;color:white}
+#clearBtn{background:#555;color:white}
+button:disabled{opacity:.55}
+.message{text-align:center;margin-top:10px;color:#666;font-size:13px;min-height:20px}
+.map-title{text-align:center;font-weight:bold;margin:14px 0 7px}
+#map{width:100%;height:310px;border-radius:10px;overflow:hidden}
+.legend{font-size:12px;color:#666;margin-top:7px;text-align:center}
+.hidden{display:none!important}
+</style>
+</head>
+
+<body>
+<div class="card">
+  <h2>🏍️ Live GPS Tracker</h2>
+  <div id="modeBox" class="mode">VIEWER MODE</div>
+
+  <div id="status" class="status">🔴 Tracking OFF</div>
+
+  <div class="row"><span>Latitude</span><span id="latitude" class="value">-</span></div>
+  <div class="row"><span>Longitude</span><span id="longitude" class="value">-</span></div>
+  <div class="row"><span>Speed</span><span id="speed" class="value">0.0 m/s</span></div>
+  <div class="row"><span>Accuracy</span><span id="accuracy" class="value">-</span></div>
+  <div class="row"><span>Distance</span><span id="distance" class="value">0 m</span></div>
+  <div class="row"><span>Max Speed</span><span id="maxSpeed" class="value">0.0 m/s</span></div>
+  <div class="row"><span>Last Update</span><span id="lastUpdate" class="value">-</span></div>
+
+  <button id="startBtn">🟢 START TRACKING</button>
+  <button id="stopBtn" disabled>🔴 STOP TRACKING</button>
+  <button id="clearBtn" class="hidden">🗑️ CLEAR ROUTE</button>
+
+  <div id="message" class="message">Viewer is waiting for live location...</div>
+
+  <div class="map-title">🗺️ Live Location & Route</div>
+  <div id="map"></div>
+  <div class="legend">📍 Current location &nbsp; • &nbsp; 🔵 Route history</div>
+</div>
+
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+
+<script type="module">
+import { initializeApp } from "https://www.gstatic.com/firebasejs/12.1.0/firebase-app.js";
+import {
+  getDatabase, ref, set, push, onValue, remove
+} from "https://www.gstatic.com/firebasejs/12.1.0/firebase-database.js";
+
+/* =========================================================
+   FIREBASE CONFIG
+   IMPORTANT: Replace ONLY the appId below with the real
+   Firebase Web App ID from Firebase Console if it is still
+   a placeholder.
+   ========================================================= */
+const firebaseConfig = {
+  apiKey: "AIzaSyA4hzTL8iHzrd8bMxyg7NECZZQjNqYMoXQ",
+  authDomain: "bike-fb123.firebaseapp.com",
+  projectId: "bike-fb123",
+  databaseURL: "https://bike-fb123-default-rtdb.asia-southeast1.firebasedatabase.app",
+  storageBucket: "bike-fb123.firebasestorage.app",
+  messagingSenderId: "754680381192",
+  appId: "1:754680381192:web:28c5153271e3550171b6bd"
+};
+
+const app = initializeApp(firebaseConfig);
+const database = getDatabase(app);
+
+const statusBox=document.getElementById("status");
+const latitudeBox=document.getElementById("latitude");
+const longitudeBox=document.getElementById("longitude");
+const speedBox=document.getElementById("speed");
+const accuracyBox=document.getElementById("accuracy");
+const distanceBox=document.getElementById("distance");
+const maxSpeedBox=document.getElementById("maxSpeed");
+const lastUpdateBox=document.getElementById("lastUpdate");
+const startBtn=document.getElementById("startBtn");
+const stopBtn=document.getElementById("stopBtn");
+const clearBtn=document.getElementById("clearBtn");
+const messageBox=document.getElementById("message");
+const modeBox=document.getElementById("modeBox");
+
+const isViewer = new URLSearchParams(location.search).get("mode") === "viewer";
+
+/* ---------- MAP ---------- */
+const defaultCenter=[32.898016,75.119597];
+const map=L.map("map").setView(defaultCenter,16);
+
+L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png",{
+  maxZoom:19,
+  attribution:"&copy; OpenStreetMap contributors"
+}).addTo(map);
+
+let liveMarker=null;
+let routeLine=L.polyline([], {weight:5}).addTo(map);
+let mapCentered=false;
+
+/* ---------- SPEED / GPS FILTER ---------- */
+let watchId=null;
+let previousPoint=null;
+let movementCandidateCount=0;
+let filteredSpeedMS=0;
+let totalDistance=0;
+let maxSpeedMS=0;
+
+function distanceMeters(lat1,lon1,lat2,lon2){
+  const R=6371000;
+  const dLat=(lat2-lat1)*Math.PI/180;
+  const dLon=(lon2-lon1)*Math.PI/180;
+  const a=Math.sin(dLat/2)**2+
+    Math.cos(lat1*Math.PI/180)*Math.cos(lat2*Math.PI/180)*
+    Math.sin(dLon/2)**2;
+  return 2*R*Math.atan2(Math.sqrt(a),Math.sqrt(1-a));
+}
+
+function updateMarker(lat,lon){
+  const p=[lat,lon];
+  if(!liveMarker){
+    liveMarker=L.marker(p).addTo(map).bindPopup("📍 Live GPS Location");
+  }else{
+    liveMarker.setLatLng(p);
+  }
+  if(!mapCentered){
+    map.setView(p,17);
+    mapCentered=true;
+  }
+}
+
+function addRoutePoint(lat,lon){
+  routeLine.addLatLng([lat,lon]);
+}
+
+function resetLocalStats(){
+  previousPoint=null;
+  movementCandidateCount=0;
+  filteredSpeedMS=0;
+  totalDistance=0;
+  maxSpeedMS=0;
+  distanceBox.innerText="0 m";
+  maxSpeedBox.innerText="0.0 m/s";
+}
+
+function formatDistance(m){
+  if(m<1000) return m.toFixed(0)+" m";
+  return (m/1000).toFixed(2)+" km";
+}
+
+/* ---------- FIREBASE LIVE DATA ---------- */
+onValue(ref(database,"gps/current"), snapshot=>{
+  const data=snapshot.val();
+  if(!data) return;
+
+  const lat=Number(data.latitude);
+  const lon=Number(data.longitude);
+  if(!Number.isFinite(lat)||!Number.isFinite(lon)) return;
+
+  latitudeBox.innerText=lat.toFixed(6);
+  longitudeBox.innerText=lon.toFixed(6);
+
+  const sp=Number(data.speed);
+  const acc=Number(data.accuracy);
+
+  if(Number.isFinite(sp)) speedBox.innerText=sp.toFixed(1)+" m/s";
+  if(Number.isFinite(acc)) accuracyBox.innerText=acc.toFixed(1)+" m";
+  if(data.lastUpdate) lastUpdateBox.innerText=data.lastUpdate;
+
+  updateMarker(lat,lon);
+
+  if(data.tracking===true){
+    statusBox.innerText="🟢 TRACKING LIVE";
+    statusBox.classList.add("on");
+  }else{
+    statusBox.innerText="🟡 LAST LOCATION";
+    statusBox.classList.remove("on");
+  }
+});
+
+/* Route history is shared through Firebase. */
+onValue(ref(database,"gps/history"), snapshot=>{
+  const data=snapshot.val();
+  const points=[];
+
+  if(data){
+    Object.keys(data).sort((a,b)=>{
+      return (Number(data[a].timestamp)||0)-(Number(data[b].timestamp)||0);
+    }).forEach(k=>{
+      const lat=Number(data[k].latitude);
+      const lon=Number(data[k].longitude);
+      if(Number.isFinite(lat)&&Number.isFinite(lon)){
+        points.push([lat,lon]);
+      }
+    });
+  }
+
+  routeLine.setLatLngs(points);
+
+  if(points.length && !mapCentered){
+    map.setView(points[points.length-1],17);
+    mapCentered=true;
+  }
+});
+
+/* ---------- TRACKER MODE ---------- */
+function locationSuccess(position){
+  const coords=position.coords;
+  const latitude=coords.latitude;
+  const longitude=coords.longitude;
+  const accuracy=Number.isFinite(coords.accuracy)?coords.accuracy:999;
+  const nowMs=Date.now();
+
+  if(previousPoint===null){
+    previousPoint={latitude,longitude,time:nowMs};
+    filteredSpeedMS=0;
+    movementCandidateCount=0;
+  }else{
+    const elapsed=(nowMs-previousPoint.time)/1000;
+    const distance=distanceMeters(
+      previousPoint.latitude,previousPoint.longitude,
+      latitude,longitude
+    );
+
+    const driftThreshold=Math.max(8,Math.min(20,accuracy*1.25));
+
+    if(elapsed>0 && elapsed<=30 && distance>driftThreshold){
+      const calculatedSpeed=distance/elapsed;
+
+      if(calculatedSpeed>=0.5 && calculatedSpeed<=100){
+        movementCandidateCount++;
+        if(movementCandidateCount>=2){
+          filteredSpeedMS=calculatedSpeed;
+          totalDistance+=distance;
+        }
+      }else{
+        movementCandidateCount=0;
+        filteredSpeedMS=0;
+      }
+    }else{
+      movementCandidateCount=0;
+      filteredSpeedMS=0;
+    }
+
+    previousPoint={latitude,longitude,time:nowMs};
+  }
+
+  if(filteredSpeedMS<0.5||!Number.isFinite(filteredSpeedMS)){
+    filteredSpeedMS=0;
+  }
+
+  if(filteredSpeedMS>maxSpeedMS) maxSpeedMS=filteredSpeedMS;
+
+  latitudeBox.innerText=latitude.toFixed(6);
+  longitudeBox.innerText=longitude.toFixed(6);
+  speedBox.innerText=filteredSpeedMS.toFixed(1)+" m/s";
+  accuracyBox.innerText=accuracy.toFixed(1)+" m";
+  distanceBox.innerText=formatDistance(totalDistance);
+  maxSpeedBox.innerText=maxSpeedMS.toFixed(1)+" m/s";
+
+  const now=new Date();
+  lastUpdateBox.innerText=now.toLocaleTimeString();
+  messageBox.innerText="📡 GPS location received";
+
+  updateMarker(latitude,longitude);
+  addRoutePoint(latitude,longitude);
+
+  set(ref(database,"gps/current"),{
+    latitude,
+    longitude,
+    speed:Number(filteredSpeedMS.toFixed(1)),
+    speedUnit:"m/s",
+    accuracy:Number(accuracy.toFixed(1)),
+    tracking:true,
+    timestamp:Date.now(),
+    lastUpdate:now.toLocaleString()
+  }).catch(error=>console.log("Firebase current error:",error));
+
+  /* Save route point. */
+  push(ref(database,"gps/history"),{
+    latitude,
+    longitude,
+    speed:Number(filteredSpeedMS.toFixed(1)),
+    accuracy:Number(accuracy.toFixed(1)),
+    timestamp:Date.now()
+  }).catch(error=>console.log("Firebase history error:",error));
+}
+
+function locationError(error){
+  if(error.code===1) messageBox.innerText="❌ GPS permission denied. Location permission Allow karein.";
+  else if(error.code===2) messageBox.innerText="❌ Location available nahi hai. Mobile GPS ON karein.";
+  else if(error.code===3) messageBox.innerText="⏳ GPS timeout. Thodi der wait karein.";
+  else messageBox.innerText="❌ GPS error: "+error.message;
+}
+
+startBtn.addEventListener("click",()=>{
+  if(!navigator.geolocation){
+    messageBox.innerText="❌ Is browser mein GPS supported nahi hai.";
+    return;
+  }
+
+  resetLocalStats();
+  mapCentered=false;
+
+  statusBox.innerText="🟢 TRACKING ON";
+  statusBox.classList.add("on");
+  startBtn.disabled=true;
+  stopBtn.disabled=false;
+  messageBox.innerText="📍 GPS permission maang raha hai...";
+
+  watchId=navigator.geolocation.watchPosition(locationSuccess,locationError,{
+    enableHighAccuracy:true,
+    maximumAge:0,
+    timeout:15000
+  });
+});
+
+stopBtn.addEventListener("click",()=>{
+  if(watchId!==null){
+    navigator.geolocation.clearWatch(watchId);
+    watchId=null;
+  }
+
+  previousPoint=null;
+  movementCandidateCount=0;
+  filteredSpeedMS=0;
+
+  set(ref(database,"gps/current/tracking"),false)
+    .catch(error=>console.log("Firebase stop error:",error));
+
+  statusBox.innerText="🔴 TRACKING OFF";
+  statusBox.classList.remove("on");
+  startBtn.disabled=false;
+  stopBtn.disabled=true;
+  speedBox.innerText="0.0 m/s";
+  messageBox.innerText="GPS tracking stopped.";
+});
+
+/* Clear only the shared route history. */
+clearBtn.addEventListener("click",async()=>{
+  if(!confirm("Route history clear karni hai?")) return;
+  try{
+    await remove(ref(database,"gps/history"));
+    routeLine.setLatLngs([]);
+    messageBox.innerText="🗑️ Route history cleared.";
+  }catch(error){
+    messageBox.innerText="❌ Route clear nahi hua.";
+    console.log(error);
+  }
+});
+
+/* ---------- VIEWER MODE ---------- */
+if(isViewer){
+  modeBox.innerText="👁️ VIEWER MODE — LIVE LOCATION DEKH RAHE HAIN";
+  startBtn.classList.add("hidden");
+  stopBtn.classList.add("hidden");
+  clearBtn.classList.add("hidden");
+  statusBox.innerText="🟡 WAITING FOR TRACKER";
+  statusBox.classList.remove("on");
+  messageBox.innerText="📡 Tracker mobile se live location ka wait...";
+}else{
+  modeBox.innerText="📍 TRACKER MODE — IS MOBILE KI LOCATION SHARE HO RAHI HAI";
+  clearBtn.classList.remove("hidden");
+}
+</script>
+</body>
+</html>
