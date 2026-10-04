@@ -1,0 +1,191 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Live GPS Tracker</title>
+<style>
+*{box-sizing:border-box}
+body{margin:0;padding:20px;background:#f1f3f8;font-family:Arial,sans-serif}
+.card{max-width:390px;margin:20px auto;background:white;padding:18px;border-radius:15px;box-shadow:0 4px 15px rgba(0,0,0,.15)}
+h2{text-align:center;margin:5px 0 15px}
+.status{text-align:center;padding:9px;border-radius:8px;margin-bottom:12px;font-weight:bold;background:#ffe0e0;color:#d00000}
+.status.on{background:#d9f8df;color:#12852d}
+.row{display:flex;justify-content:space-between;align-items:center;background:#f5f6f8;padding:10px;margin:6px 0;border-radius:7px;font-size:14px}
+.value{font-weight:bold;text-align:right;max-width:65%;word-break:break-word}
+button{width:100%;border:none;padding:13px;margin-top:10px;border-radius:8px;font-size:15px;font-weight:bold;cursor:pointer}
+#startBtn{background:#159447;color:white} #stopBtn{background:#d32626;color:white}
+button:disabled{opacity:.55}
+.message{text-align:center;margin-top:12px;color:#666;font-size:13px;min-height:20px}
+</style>
+</head>
+<body>
+<div class="card">
+<h2>🏍️ Live GPS Tracker</h2>
+<div id="status" class="status">🔴 Tracking OFF</div>
+<div class="row"><span>Latitude</span><span id="latitude" class="value">-</span></div>
+<div class="row"><span>Longitude</span><span id="longitude" class="value">-</span></div>
+<div class="row"><span>Speed</span><span id="speed" class="value">-</span></div>
+<div class="row"><span>Accuracy</span><span id="accuracy" class="value">-</span></div>
+<div class="row"><span>Last Update</span><span id="lastUpdate" class="value">-</span></div>
+<button id="startBtn">🟢 START TRACKING</button>
+<button id="stopBtn" disabled>🔴 STOP TRACKING</button>
+<div id="message" class="message">Start button dabakar GPS permission allow karein.</div>
+</div>
+
+<script type="module">
+import { initializeApp } from "https://www.gstatic.com/firebasejs/12.1.0/firebase-app.js";
+import { getDatabase, ref, set } from "https://www.gstatic.com/firebasejs/12.1.0/firebase-database.js";
+
+const firebaseConfig = {
+  apiKey: "AIzaSyA4hzTL8iHzrd8bMxyg7NECZZQjNqYMoXQ",
+  authDomain: "bike-fb123.firebaseapp.com",
+  projectId: "bike-fb123",
+  storageBucket: "bike-fb123.firebasestorage.app",
+  messagingSenderId: "754680381192",
+  appId: "PASTE_YOUR_REAL_FIREBASE_APP_ID_HERE"
+};
+
+const app = initializeApp(firebaseConfig);
+const database = getDatabase(app);
+
+const statusBox=document.getElementById("status");
+const latitudeBox=document.getElementById("latitude");
+const longitudeBox=document.getElementById("longitude");
+const speedBox=document.getElementById("speed");
+const accuracyBox=document.getElementById("accuracy");
+const lastUpdateBox=document.getElementById("lastUpdate");
+const startBtn=document.getElementById("startBtn");
+const stopBtn=document.getElementById("stopBtn");
+const messageBox=document.getElementById("message");
+
+let watchId=null;
+
+// Speed filtering: GPS drift ko movement nahi maana jayega.
+let previousPoint=null;
+let movementCandidateCount=0;
+let filteredSpeedMS=0;
+
+startBtn.addEventListener("click",()=>{
+  if(!navigator.geolocation){
+    messageBox.innerText="❌ Is browser mein GPS supported nahi hai.";
+    return;
+  }
+  previousPoint=null;
+  movementCandidateCount=0;
+  filteredSpeedMS=0;
+  statusBox.innerText="🟢 Tracking ON";
+  statusBox.classList.add("on");
+  startBtn.disabled=true;
+  stopBtn.disabled=false;
+  messageBox.innerText="📍 GPS permission maang raha hai...";
+
+  watchId=navigator.geolocation.watchPosition(locationSuccess,locationError,{
+    enableHighAccuracy:true, maximumAge:0, timeout:15000
+  });
+});
+
+function distanceMeters(lat1,lon1,lat2,lon2){
+  const R=6371000;
+  const dLat=(lat2-lat1)*Math.PI/180;
+  const dLon=(lon2-lon1)*Math.PI/180;
+  const a=Math.sin(dLat/2)**2+
+    Math.cos(lat1*Math.PI/180)*Math.cos(lat2*Math.PI/180)*
+    Math.sin(dLon/2)**2;
+  return 2*R*Math.atan2(Math.sqrt(a),Math.sqrt(1-a));
+}
+
+function locationSuccess(position){
+  const coords=position.coords;
+  const latitude=coords.latitude;
+  const longitude=coords.longitude;
+  const accuracy=Number.isFinite(coords.accuracy) ? coords.accuracy : 999;
+  const nowMs=Date.now();
+
+  // Pehli GPS reading: speed ko 0 rakho.
+  if(previousPoint===null){
+    previousPoint={latitude,longitude,time:nowMs};
+    filteredSpeedMS=0;
+    movementCandidateCount=0;
+  }else{
+    const elapsed=(nowMs-previousPoint.time)/1000;
+    const distance=distanceMeters(
+      previousPoint.latitude,previousPoint.longitude,
+      latitude,longitude
+    );
+
+    // GPS accuracy ke hisaab se drift threshold.
+    // Stable phone ke chhote GPS jumps ko movement nahi maana jayega.
+    const driftThreshold=Math.max(8, Math.min(20, accuracy*1.25));
+
+    if(elapsed>0 && elapsed<=30 && distance>driftThreshold){
+      const calculatedSpeed=distance/elapsed;
+
+      // Actual movement ko confirm karne ke liye 2 consecutive readings.
+      // Isse stable phone par speed 1-2 m/s ki random jump nahi karegi.
+      if(calculatedSpeed>=0.5){
+        movementCandidateCount++;
+        if(movementCandidateCount>=2){
+          filteredSpeedMS=calculatedSpeed;
+        }
+      }else{
+        movementCandidateCount=0;
+        filteredSpeedMS=0;
+      }
+    }else{
+      movementCandidateCount=0;
+      filteredSpeedMS=0;
+    }
+
+    previousPoint={latitude,longitude,time:nowMs};
+  }
+
+  // Very low speed ko 0 m/s.
+  if(filteredSpeedMS<0.5 || !Number.isFinite(filteredSpeedMS)){
+    filteredSpeedMS=0;
+  }
+
+  latitudeBox.innerText=latitude.toFixed(6);
+  longitudeBox.innerText=longitude.toFixed(6);
+  speedBox.innerText=filteredSpeedMS.toFixed(1)+" m/s";
+  accuracyBox.innerText=accuracy.toFixed(1)+" m";
+
+  const now=new Date();
+  lastUpdateBox.innerText=now.toLocaleTimeString();
+  messageBox.innerText="📡 GPS location received";
+
+  set(ref(database,"gps/current"),{
+    latitude:latitude,
+    longitude:longitude,
+    speed:Number(filteredSpeedMS.toFixed(1)),
+    speedUnit:"m/s",
+    accuracy:Number(accuracy.toFixed(1)),
+    timestamp:Date.now(),
+    lastUpdate:now.toLocaleString()
+  }).catch(error=>console.log("Firebase error:",error));
+}
+
+function locationError(error){
+  if(error.code===1) messageBox.innerText="❌ GPS permission denied. Location permission Allow karein.";
+  else if(error.code===2) messageBox.innerText="❌ Location available nahi hai. Mobile GPS ON karein.";
+  else if(error.code===3) messageBox.innerText="⏳ GPS timeout. Thodi der wait karein.";
+  else messageBox.innerText="❌ GPS error: "+error.message;
+}
+
+stopBtn.addEventListener("click",()=>{
+  if(watchId!==null){
+    navigator.geolocation.clearWatch(watchId);
+    watchId=null;
+  }
+  previousPoint=null;
+  movementCandidateCount=0;
+  filteredSpeedMS=0;
+  statusBox.innerText="🔴 Tracking OFF";
+  statusBox.classList.remove("on");
+  startBtn.disabled=false;
+  stopBtn.disabled=true;
+  messageBox.innerText="GPS tracking stopped.";
+});
+</script>
+</body>
+</html>
